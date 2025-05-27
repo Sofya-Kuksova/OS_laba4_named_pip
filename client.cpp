@@ -1,7 +1,6 @@
 #include <windows.h>
 #include <iostream>
 #include <string>
-#include <algorithm>
 
 
 HANDLE hPipe = INVALID_HANDLE_VALUE;
