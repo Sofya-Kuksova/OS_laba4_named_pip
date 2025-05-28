@@ -1,10 +1,12 @@
+// client.cpp: клиент асинхронного чтения из именованного канала
 #include <windows.h>
 #include <iostream>
 #include <string>
+#include <algorithm>
 
+HANDLE hPipe = INVALID_HANDLE_VALUE;  // дескриптор канала
 
-HANDLE hPipe = INVALID_HANDLE_VALUE;
-
+// Функция чтения выбора из меню (безопасная конвертация в int)
 int ReadMenuChoice() {
     while (true) {
         std::string line;
@@ -17,6 +19,7 @@ int ReadMenuChoice() {
     }
 }
 
+// Подключение к серверу через именованный канал
 void ConnectToServer() {
     const TCHAR* name = TEXT("\\\\.\\pipe\\PipeSrv");
 
@@ -25,7 +28,6 @@ void ConnectToServer() {
         hPipe = INVALID_HANDLE_VALUE;
     }
 
-    // Ждём не дольше 5 секунд
     if (!WaitNamedPipe(name, 2000 /* ms */)) {
         std::cerr << "Timeout waiting for pipe (2s). GLE=" 
                   << GetLastError() << "\n";
@@ -40,7 +42,7 @@ void ConnectToServer() {
         FILE_FLAG_OVERLAPPED,
         NULL
     );
-    
+
     if (hPipe == INVALID_HANDLE_VALUE) {
         std::cerr << "CreateFile failed, GLE=" << GetLastError() << "\n";
     } else {
@@ -48,35 +50,34 @@ void ConnectToServer() {
     }
 }
 
-VOID CALLBACK ReadCompleted(DWORD err, DWORD bytes, LPOVERLAPPED lpOv) {
-    char* buf = reinterpret_cast<char*>(lpOv) + sizeof(OVERLAPPED);
-    if (err == 0 && bytes > 0) {
-        buf[bytes] = '\0';
+// Обработчик завершения асинхронного чтения
+VOID CALLBACK ReadCompleted(
+    DWORD dwErrorCode,
+    DWORD dwNumberOfBytesTransfered,
+    LPOVERLAPPED lpOverlapped
+) {
+    // Буфер расположен сразу после структуры OVERLAPPED
+    char* buf = reinterpret_cast<char*>(lpOverlapped) + sizeof(OVERLAPPED);
+    if (dwErrorCode == 0 && dwNumberOfBytesTransfered > 0) {
+        buf[dwNumberOfBytesTransfered] = '\0';
         std::cout << "Received: " << buf << "\n";
     } else {
-        std::cerr << "Read error or no data. code=" << err << "\n";
+        std::cerr << "Read error or no data. code=" << dwErrorCode << "\n";
     }
-    // удалим память, выделенную под OVERLAPPED+буфер
-    HeapFree(GetProcessHeap(), 0, lpOv);
+    // Освобождаем память, выделенную под OVERLAPPED + буфер
+    HeapFree(GetProcessHeap(), 0, lpOverlapped);
 }
 
+// Функция асинхронного чтения из канала
 void ReadAsync() {
     if (hPipe == INVALID_HANDLE_VALUE) {
         std::cout << "You must connect first.\n";
         return;
     }
 
-    // 1) Проверяем, есть ли данные в канале
+    // Проверяем наличие данных без чтения
     DWORD totalBytesAvail = 0;
-    BOOL okPeek = PeekNamedPipe(
-        hPipe,
-        NULL,       // не читаем данные
-        0,
-        NULL,
-        &totalBytesAvail,
-        NULL
-    );
-    if (!okPeek) {
+    if (!PeekNamedPipe(hPipe, NULL, 0, NULL, &totalBytesAvail, NULL)) {
         std::cerr << "PeekNamedPipe failed, GLE=" << GetLastError() << "\n";
         return;
     }
@@ -85,29 +86,21 @@ void ReadAsync() {
         return;
     }
 
-    // 2) Если данные есть — продолжаем асинхронное чтение
+    // Выделяем блок памяти: OVERLAPPED + буфер
     const DWORD bufSize = 1024;
-    BYTE* block = (BYTE*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-                                   sizeof(OVERLAPPED) + bufSize);
+    BYTE* block = static_cast<BYTE*>(
+        HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(OVERLAPPED) + bufSize)
+    );
     auto* ov = reinterpret_cast<OVERLAPPED*>(block);
     char* buffer = reinterpret_cast<char*>(block + sizeof(OVERLAPPED));
 
+    // Запускаем асинхронное чтение с CALLBACK-функцией
     BOOL okRead = ReadFileEx(
         hPipe,
         buffer,
-        std::min(bufSize - 1, totalBytesAvail),  // читаем не больше, чем есть
+        std::min(bufSize - 1, totalBytesAvail),
         ov,
-        [](DWORD err, DWORD bytes, LPOVERLAPPED lpOv) {
-            auto* buf = reinterpret_cast<char*>(
-                reinterpret_cast<BYTE*>(lpOv) + sizeof(OVERLAPPED));
-            if (err == 0 && bytes > 0) {
-                buf[bytes] = '\0';
-                std::cout << "Received: " << buf << "\n";
-            } else {
-                std::cerr << "Read error or no data. code=" << err << "\n";
-            }
-            HeapFree(GetProcessHeap(), 0, lpOv);
-        }
+        ReadCompleted
     );
     if (!okRead) {
         std::cerr << "ReadFileEx failed, GLE=" << GetLastError() << "\n";
@@ -116,6 +109,7 @@ void ReadAsync() {
     }
 
     std::cout << "Waiting for data...\n";
+    // SleepEx с TRUE позволяет обработать APC-колбэки
     SleepEx(INFINITE, TRUE);
 }
 
@@ -137,6 +131,8 @@ int main() {
         }
     }
 
-    if (hPipe != INVALID_HANDLE_VALUE) CloseHandle(hPipe);
+    if (hPipe != INVALID_HANDLE_VALUE) {
+        CloseHandle(hPipe);
+    }
     return 0;
 }
